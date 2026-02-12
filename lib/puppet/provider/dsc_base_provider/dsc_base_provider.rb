@@ -140,7 +140,10 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
 
     # If the resource has already been queried, do not bother querying for it again
     cached_results = fetch_cached_hashes(@cached_query_results, names)
-    return cached_results unless cached_results.empty?
+    unless cached_results.empty?
+      context.notice("GET-DIAG: returning from @cached_query_results, dsc_ values: #{cached_results.first&.select { |k, _v| k.to_s.start_with?('dsc_') }.inspect}")
+      return cached_results
+    end
 
     # Use the raw system state from canonicalize's Get call if available.
     # @cached_canonicalize_results has the unmodified DSC Get response (before
@@ -149,6 +152,7 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     unless @cached_canonicalize_results.empty?
       canon_results = fetch_cached_hashes(@cached_canonicalize_results, names)
       unless canon_results.empty?
+        context.notice("GET-DIAG: returning from @cached_canonicalize_results, dsc_ values: #{canon_results.first&.select { |k, _v| k.to_s.start_with?('dsc_') }.inspect}")
         # Cache these as query results too so subsequent get() calls find them
         canon_results.each do |r|
           @cached_query_results << r.dup if fetch_cached_hashes(@cached_query_results, [r]).empty?
@@ -167,6 +171,7 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       # If dsc_psdscrunascredential was specified, re-add it here.
       mandatory_properties[:dsc_psdscrunascredential] = canonicalized_resource[:dsc_psdscrunascredential] if canonicalized_resource.key?(:dsc_psdscrunascredential)
     end
+    context.notice('GET-DIAG: no cache hit, making fresh invoke_get_method call')
     names.collect do |name|
       name = { name: name } if name.is_a? String
       invoke_get_method(context, name.merge(mandatory_properties))
@@ -187,9 +192,11 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       # If should is an array instead of a hash and only has one entry, use that.
       should = should.first if should.is_a?(Array) && should.length == 1
 
-      # Log per-property change detail since the Resource API does not generate
-      # per-property events when custom_insync is declared as a feature.
-      log_change_detail(context, name, is, should)
+      # Log per-property change detail. The normal "is" hash from get() may have
+      # empty values due to cache/pipeline issues. Try a fresh DSC Get call that
+      # bypasses all caching to get real current values for the log output.
+      fresh_is = get_fresh_state_for_logging(context, name, should)
+      log_change_detail(context, name, fresh_is || is, should)
 
       # for compatibility sake, we use dsc_ensure instead of ensure, so context.type.ensurable? does not work
       if context.type.attributes.key?(:dsc_ensure)
@@ -247,6 +254,39 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
 
       context.notice(name, "#{property}: '#{current_value}' -> '#{desired_value}'")
     end
+  end
+
+  # Performs a fresh DSC Get call completely bypassing all caches to retrieve the actual
+  # current system state. Used for logging real "Changed from" values when the normal
+  # get() pipeline returns empty values due to cache/pipeline issues.
+  #
+  # @param context [Object] the Puppet runtime context to operate in and send feedback to
+  # @param name [Hash] the name hash for the resource
+  # @param should [Hash] the desired state hash (used to extract query properties)
+  # @return [Hash] returns a hash with dsc_ prefixed keys and current system values, or nil on failure
+  def get_fresh_state_for_logging(context, name, should)
+    query_props = should.select { |k, v| mandatory_get_attributes(context).include?(k) || (k == :dsc_psdscrunascredential && !v.nil?) }
+    data = invoke_dsc_resource(context, name, query_props, 'get')
+    return nil if data.nil?
+
+    context.notice("FRESH-GET: raw DSC Get result: #{data.inspect}")
+
+    # Minimal key processing to match the dsc_ prefix format used by Puppet types
+    valid_attributes = context.type.attributes.keys.collect(&:to_s)
+    result = {}
+    data.each do |key, value|
+      type_key = :"dsc_#{key.downcase}"
+      next unless valid_attributes.include?(type_key.to_s)
+
+      result[type_key] = value
+    end
+    result[:name] = name.is_a?(Hash) ? name[:name] : name
+
+    context.notice("FRESH-GET: processed for logging: #{result.inspect}")
+    result
+  rescue StandardError => e
+    context.debug("FRESH-GET: failed (#{e.message}) — falling back to cached is state")
+    nil
   end
 
   # Attempts to set an instance of the DSC resource, invoking the `Set` method and thinly wrapping
@@ -489,6 +529,12 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     data = invoke_dsc_resource(context, name_hash, query_props, 'get')
     return nil if data.nil?
 
+    # PIPELINE-DIAG: Log the raw data from invoke_dsc_resource BEFORE any Ruby processing.
+    # This is the JSON-parsed output from ConvertTo-CanonicalResult on the PowerShell side.
+    # If values are present here, the data loss is in the Ruby pipeline below.
+    # If values are null/empty here, the data loss is in the PowerShell pipeline.
+    context.notice("PIPELINE-DIAG: raw from invoke_dsc_resource: #{data.select { |k, _v| k.to_s !~ /^(PSComputerName|ensure)$/i }.inspect}")
+
     # DSC gives back information we don't care about; filter down to only
     # those properties exposed in the type definition.
     valid_attributes = context.type.attributes.keys.collect(&:to_s)
@@ -526,6 +572,9 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     data[:name] = name_hash[:name]
 
     data = stringify_nil_attributes(context, data)
+
+    # PIPELINE-DIAG: Log after stringify_nil_attributes to see if values were converted to ''
+    context.notice("PIPELINE-DIAG: after stringify_nil_attributes: #{data.select { |k, _v| k.to_s.start_with?('dsc_') }.inspect}")
 
     # Have to check for this to avoid a weird canonicalization warning
     # The Resource API calls canonicalize against the current state which
