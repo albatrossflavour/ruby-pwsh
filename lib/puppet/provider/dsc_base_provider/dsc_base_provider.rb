@@ -413,19 +413,23 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       return prior_result.empty? ? invoke_test_method(context, name, should_hash) : prior_result.first[:in_desired_state]
     end
 
-    # Diagnostic logging: capture the actual values being compared so we can
-    # identify what's causing false positives and blank "Changed from" values.
+    # Property mode: DSC's Get method can return null for properties it can't
+    # determine — e.g. the setting isn't explicitly in the system policy, or
+    # Get's internal reverse lookup failed. These null values become either nil
+    # or '' in Ruby (stringify_nil_attributes converts nil to '' for String-type
+    # attributes). Either way, the comparison against a real "should" value fails,
+    # producing false positive changes with blank "Changed from" in reports.
+    #
+    # When we detect this situation, fall back to DSC Test for a definitive
+    # answer on whether the resource is actually in the desired state.
     is_value = is_hash.is_a?(Hash) ? is_hash[property_name] : nil
     should_value = should_hash.is_a?(Hash) ? should_hash[property_name] : nil
-    context.notice("insync? DIAG: property=#{property_name} is=#{is_value.inspect} should=#{should_value.inspect} is_hash_keys=#{is_hash.is_a?(Hash) ? is_hash.keys.length : 'N/A'} should_hash_keys=#{should_hash.is_a?(Hash) ? should_hash.keys.length : 'N/A'}")
 
-    # Property mode: check if DSC Get returned nil for this property while
-    # the manifest declares a desired value. This happens when DSC's Get method
-    # can't determine the current value — e.g. the setting isn't explicitly in
-    # the security policy, or Get's internal reverse lookup failed. DSC Test
-    # handles these cases correctly, so use it as a fallback.
-    if is_value.nil? && !should_value.nil?
-      context.notice("insync? DIAG: nil 'is' detected for #{property_name}, falling back to DSC Test")
+    is_missing = is_value.nil? || (is_value.respond_to?(:empty?) && is_value.empty?)
+    should_present = !should_value.nil? && !(should_value.respond_to?(:empty?) && should_value.empty?)
+
+    if is_missing && should_present
+      context.debug("Property '#{property_name}' has nil/empty 'is' value from DSC Get; falling back to DSC Test")
       prior_result = fetch_cached_hashes(@cached_test_results, [name])
       test_result = if prior_result.empty?
                       invoke_test_method(context, name, should_hash)
@@ -434,13 +438,10 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
                     end
       # invoke_test_method returns true when in desired state,
       # or [false, change_log] when not in desired state
-      result = test_result.is_a?(Array) ? test_result.first : test_result
-      context.notice("insync? DIAG: DSC Test result for #{property_name}: #{result.inspect}")
-      return result
+      return test_result.is_a?(Array) ? test_result.first : test_result
     end
 
     # Default: let the Resource API handle per-property comparison
-    context.notice("insync? DIAG: falling through to default comparison for #{property_name}")
     nil
   end
 
