@@ -15,6 +15,7 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     @cached_canonicalize_results = [] # Cache for invoke_get_method calls from canonicalize only
     @cached_query_results = []        # Cache for invoke_get_method calls from get only
     @cached_test_results = []
+    @cached_per_property_test_results = {}
     @logon_failures = []
     @timeout = nil # default timeout, ps_manager.execute is expecting nil by default..
     super
@@ -419,9 +420,6 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     # or '' in Ruby (stringify_nil_attributes converts nil to '' for String-type
     # attributes). Either way, the comparison against a real "should" value fails,
     # producing false positive changes with blank "Changed from" in reports.
-    #
-    # When we detect this situation, fall back to DSC Test for a definitive
-    # answer on whether the resource is actually in the desired state.
     is_value = is_hash.is_a?(Hash) ? is_hash[property_name] : nil
     should_value = should_hash.is_a?(Hash) ? should_hash[property_name] : nil
 
@@ -429,16 +427,42 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     should_present = !should_value.nil? && !(should_value.respond_to?(:empty?) && should_value.empty?)
 
     if is_missing && should_present
-      context.debug("Property '#{property_name}' has nil/empty 'is' value from DSC Get; falling back to DSC Test")
+      # First, check the overall DSC Test result for the whole resource
       prior_result = fetch_cached_hashes(@cached_test_results, [name])
-      test_result = if prior_result.empty?
-                      invoke_test_method(context, name, should_hash)
-                    else
-                      prior_result.first[:in_desired_state]
-                    end
-      # invoke_test_method returns true when in desired state,
-      # or [false, change_log] when not in desired state
-      return test_result.is_a?(Array) ? test_result.first : test_result
+      overall_result = if prior_result.empty?
+                         invoke_test_method(context, name, should_hash)
+                       else
+                         prior_result.first[:in_desired_state]
+                       end
+      overall_in_sync = overall_result.is_a?(Array) ? overall_result.first : overall_result
+
+      # If the whole resource is in desired state, this property is fine
+      return true if overall_in_sync
+
+      # Resource is NOT in desired state. Rather than blaming every nil/empty
+      # property, test this specific property individually against DSC to see
+      # if it's the one that actually needs changing.
+      if property_name.to_s.start_with?('dsc_')
+        cache_key = [name, property_name]
+        unless @cached_per_property_test_results.key?(cache_key)
+          context.debug("Testing property '#{property_name}' individually against DSC")
+          namevar_keys = namevar_attributes(context).select { |k| k.to_s.start_with?('dsc_') }
+          minimal_props = {}
+          namevar_keys.each { |k| minimal_props[k] = should_hash[k] if should_hash.key?(k) }
+          minimal_props[property_name] = should_hash[property_name]
+          data = invoke_dsc_resource(context, name, minimal_props, 'test')
+          @cached_per_property_test_results[cache_key] = data.nil? ? nil : data['indesiredstate']
+        end
+
+        per_prop_result = @cached_per_property_test_results[cache_key]
+        # nil = DSC call failed, fall through to overall result
+        # true = this specific property is in desired state, don't flag it
+        # false = this specific property is genuinely out of sync
+        return per_prop_result unless per_prop_result.nil?
+      end
+
+      # Fallback: per-property test unavailable or failed — use overall result
+      return false
     end
 
     # Default: let the Resource API handle per-property comparison
