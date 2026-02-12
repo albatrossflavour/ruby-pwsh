@@ -445,22 +445,26 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       if property_name.to_s.start_with?('dsc_')
         cache_key = [name, property_name]
         unless @cached_per_property_test_results.key?(cache_key)
-          context.debug("Testing property '#{property_name}' individually against DSC")
+          context.notice("DIAG: Per-property test for '#{property_name}' with should=#{should_value.inspect}")
           namevar_keys = namevar_attributes(context).select { |k| k.to_s.start_with?('dsc_') }
           minimal_props = {}
           namevar_keys.each { |k| minimal_props[k] = should_hash[k] if should_hash.key?(k) }
           minimal_props[property_name] = should_hash[property_name]
+          context.notice("DIAG: minimal_props=#{minimal_props.inspect}")
           data = invoke_dsc_resource(context, name, minimal_props, 'test')
+          context.notice("DIAG: invoke_dsc_resource returned: #{data.inspect}")
           @cached_per_property_test_results[cache_key] = data.nil? ? nil : data['indesiredstate']
         end
 
         per_prop_result = @cached_per_property_test_results[cache_key]
+        context.notice("DIAG: per_prop_result for '#{property_name}' = #{per_prop_result.inspect}")
         # nil = DSC call failed, fall through to overall result
         # true = this specific property is in desired state, don't flag it
         # false = this specific property is genuinely out of sync
         return per_prop_result unless per_prop_result.nil?
       end
 
+      context.notice("DIAG: Falling through to overall false for '#{property_name}'")
       # Fallback: per-property test unavailable or failed — use overall result
       return false
     end
