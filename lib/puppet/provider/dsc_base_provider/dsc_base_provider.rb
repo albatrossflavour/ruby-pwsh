@@ -12,7 +12,8 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
   # - logon failures
   def initialize
     @cached_canonicalized_resource = []
-    @cached_query_results = []
+    @cached_canonicalize_results = [] # Cache for invoke_get_method calls from canonicalize only
+    @cached_query_results = []        # Cache for invoke_get_method calls from get only
     @cached_test_results = []
     @logon_failures = []
     @timeout = nil # default timeout, ps_manager.execute is expecting nil by default..
@@ -61,7 +62,11 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
           canonicalized = r.dup
           @cached_canonicalized_resource << r.dup
         else
-          canonicalized = invoke_get_method(context, r)
+          # Use a separate cache for canonicalize's Get calls so we don't pollute
+          # @cached_query_results, which get() uses for the "is" state comparison.
+          # Sharing a cache between canonicalize and get caused the Resource API to
+          # see identical "should" and "is" values, killing per-property report detail.
+          canonicalized = invoke_get_method_for_canonicalize(context, r)
           # If the resource could not be found or was returned as absent, skip case munging and
           # treat the manifest values as canonical since the resource is being created.
           # rubocop:disable Metrics/BlockNesting
@@ -136,6 +141,21 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     cached_results = fetch_cached_hashes(@cached_query_results, names)
     return cached_results unless cached_results.empty?
 
+    # Use the raw system state from canonicalize's Get call if available.
+    # @cached_canonicalize_results has the unmodified DSC Get response (before
+    # canonicalize normalized casing). This gives the Resource API real "is" data
+    # with all property values, enabling per-property "Changed from" reporting.
+    unless @cached_canonicalize_results.empty?
+      canon_results = fetch_cached_hashes(@cached_canonicalize_results, names)
+      unless canon_results.empty?
+        # Cache these as query results too so subsequent get() calls find them
+        canon_results.each do |r|
+          @cached_query_results << r.dup if fetch_cached_hashes(@cached_query_results, [r]).empty?
+        end
+        return canon_results
+      end
+    end
+
     if @cached_canonicalized_resource.empty?
       mandatory_properties = {}
     else
@@ -158,13 +178,17 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
   #
   # @param context [Object] the Puppet runtime context to operate in and send feedback to
   # @param changes [Hash] the hash of whose key is the name_hash and value is the is and should hashes
-  def set(context, changes)
+  def set(context, changes) # rubocop:disable Metrics/MethodLength
     changes.each do |name, change|
       is = change[:is]
       should = change[:should]
 
       # If should is an array instead of a hash and only has one entry, use that.
       should = should.first if should.is_a?(Array) && should.length == 1
+
+      # Log per-property change detail since the Resource API does not generate
+      # per-property events when custom_insync is declared as a feature.
+      log_change_detail(context, name, is, should)
 
       # for compatibility sake, we use dsc_ensure instead of ensure, so context.type.ensurable? does not work
       if context.type.attributes.key?(:dsc_ensure)
@@ -198,6 +222,29 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
           update(context, name, should)
         end
       end
+    end
+  end
+
+  # Compares the is and should hashes and logs per-property change detail.
+  # The Resource API does not generate per-property change events when custom_insync
+  # is declared as a feature, so we emit them ourselves to populate report detail.
+  #
+  # @param context [Object] the Puppet runtime context to operate in and send feedback to
+  # @param name [String] the name of the resource being changed
+  # @param is [Hash] the current state of the resource
+  # @param should [Hash] the desired state of the resource
+  def log_change_detail(context, name, is, should)
+    return if is.nil? || should.nil?
+
+    should.each do |property, desired_value|
+      next unless property.to_s.start_with?('dsc_')
+      next if property == :dsc_psdscrunascredential
+
+      current_value = is[property]
+      # Skip if values are the same (case-insensitive for strings)
+      next if same?(recursively_downcase(current_value), recursively_downcase(desired_value))
+
+      context.notice(name, "#{property}: '#{current_value}' -> '#{desired_value}'")
     end
   end
 
@@ -429,6 +476,36 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     @cached_query_results << data.dup if fetch_cached_hashes(@cached_query_results, [data]).empty?
     context.debug("Returned to Puppet as #{data}")
     data
+  end
+
+  # Invokes the `Get` method for canonicalize only, using a separate cache from get().
+  # This prevents canonicalize from polluting @cached_query_results, which get() relies on
+  # to return the "is" state for the Resource API's property-by-property comparison.
+  #
+  # @param context [Object] the Puppet runtime context to operate in and send feedback to
+  # @param name_hash [Hash] the hash of namevars to be passed as properties to `Invoke-DscResource`
+  # @return [Hash] returns a hash representing the DSC resource munged to the representation the Puppet Type expects
+  def invoke_get_method_for_canonicalize(context, name_hash)
+    # Check the canonicalize-specific cache first
+    cached = fetch_cached_hashes(@cached_canonicalize_results, [name_hash.select { |k, _v| namevar_attributes(context).include?(k) }])
+    return cached.first unless cached.empty?
+
+    # Call invoke_get_method which will do the actual DSC Get call.
+    # It will also cache to @cached_query_results as a side effect — remove that entry
+    # so get() is forced to do its own fresh lookup later.
+    result = invoke_get_method(context, name_hash)
+
+    # Remove the entry that invoke_get_method just added to @cached_query_results
+    # so that get() will do its own fresh DSC Get call and produce independent "is" data.
+    @cached_query_results.reject! do |item|
+      matching = fetch_cached_hashes([item], [name_hash.select { |k, _v| namevar_attributes(context).include?(k) }])
+      !matching.empty?
+    end
+
+    # Cache in our own separate cache
+    @cached_canonicalize_results << result.dup if result && fetch_cached_hashes(@cached_canonicalize_results, [result]).empty?
+
+    result
   end
 
   # Invokes the `Set` method, passing the should hash as the properties to use with `Invoke-DscResource`
