@@ -388,22 +388,54 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     data
   end
 
-  # Determine if the DSC Resource is in the desired state, invoking the `Test` method unless it's
-  #   already been run for the resource, in which case reuse the result instead of checking for each
-  #   property. This behavior is only triggered if the validation_mode is set to resource; by default
-  #   it is set to property and uses the default property comparison logic in Puppet::Property.
+  # Determine if the DSC Resource is in the desired state. Handles three scenarios:
+  #
+  # 1. validation_mode: resource — always uses DSC Test for the definitive answer
+  # 2. validation_mode: property with nil "is" values — falls back to DSC Test because
+  #    DSC's Get method returned null for the property (common when a setting isn't
+  #    explicitly configured in the system policy or the Get method's reverse lookup
+  #    failed). Without this fallback, nil != should always produces a false positive
+  #    change with a blank "Changed from" value in reports.
+  # 3. validation_mode: property with non-nil "is" values — uses the default
+  #    property-by-property comparison from Puppet::Property
   #
   # @param context [Object] the Puppet runtime context to operate in and send feedback to
   # @param name [String] the name of the resource being tested
+  # @param property_name [Symbol] the name of the property being compared
   # @param is_hash [Hash] the current state of the resource on the system
   # @param should_hash [Hash] the desired state of the resource per the manifest
-  # @return [Boolean, Void] returns true/false if the resource is/isn't in the desired state and
-  #   the validation mode is set to resource, otherwise nil.
-  def insync?(context, name, _property_name, _is_hash, should_hash)
-    return nil if should_hash[:validation_mode] != 'resource'
+  # @return [Boolean, Void] returns true/false if the resource is/isn't in the desired state,
+  #   or nil to fall through to default property comparison.
+  def insync?(context, name, property_name, is_hash, should_hash)
+    # Resource mode: use DSC Test for everything (existing behavior)
+    if should_hash[:validation_mode] == 'resource'
+      prior_result = fetch_cached_hashes(@cached_test_results, [name])
+      return prior_result.empty? ? invoke_test_method(context, name, should_hash) : prior_result.first[:in_desired_state]
+    end
 
-    prior_result = fetch_cached_hashes(@cached_test_results, [name])
-    prior_result.empty? ? invoke_test_method(context, name, should_hash) : prior_result.first[:in_desired_state]
+    # Property mode: check if DSC Get returned nil for this property while
+    # the manifest declares a desired value. This happens when DSC's Get method
+    # can't determine the current value — e.g. the setting isn't explicitly in
+    # the security policy, or Get's internal reverse lookup failed. DSC Test
+    # handles these cases correctly, so use it as a fallback.
+    is_value = is_hash.is_a?(Hash) ? is_hash[property_name] : nil
+    should_value = should_hash.is_a?(Hash) ? should_hash[property_name] : nil
+
+    if is_value.nil? && !should_value.nil?
+      context.debug("Property '#{property_name}' has nil 'is' value from DSC Get; falling back to DSC Test")
+      prior_result = fetch_cached_hashes(@cached_test_results, [name])
+      test_result = if prior_result.empty?
+                      invoke_test_method(context, name, should_hash)
+                    else
+                      prior_result.first[:in_desired_state]
+                    end
+      # invoke_test_method returns true when in desired state,
+      # or [false, change_log] when not in desired state
+      return test_result.is_a?(Array) ? test_result.first : test_result
+    end
+
+    # Default: let the Resource API handle per-property comparison
+    nil
   end
 
   # Invokes the `Get` method, passing the name_hash as the properties to use with `Invoke-DscResource`
