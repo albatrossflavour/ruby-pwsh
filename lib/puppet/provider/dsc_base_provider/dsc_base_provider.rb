@@ -15,7 +15,7 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     @cached_canonicalize_results = [] # Cache for invoke_get_method calls from canonicalize only
     @cached_query_results = []        # Cache for invoke_get_method calls from get only
     @cached_test_results = []
-    @cached_per_property_test_results = {}
+    @cached_fresh_get_results = {}
     @logon_failures = []
     @timeout = nil # default timeout, ps_manager.execute is expecting nil by default..
     super
@@ -273,14 +273,14 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
   end
 
   # Performs a fresh DSC Get call completely bypassing all caches to retrieve the actual
-  # current system state. Used for logging real "Changed from" values when the normal
-  # get() pipeline returns empty values due to cache/pipeline issues.
+  # current system state. Used by both insync? (for accurate property comparison and
+  # change_message tuples) and set() (for DSC_WORKAROUND log entries).
   #
   # @param context [Object] the Puppet runtime context to operate in and send feedback to
   # @param name [Hash] the name hash for the resource
   # @param should [Hash] the desired state hash (used to extract query properties)
   # @return [Hash] returns a hash with dsc_ prefixed keys and current system values, or nil on failure
-  def get_fresh_state_for_logging(context, name, should)
+  def perform_fresh_get(context, name, should)
     query_props = should.select { |k, v| mandatory_get_attributes(context).include?(k) || (k == :dsc_psdscrunascredential && !v.nil?) }
     data = invoke_dsc_resource(context, name, query_props, 'get')
     return nil if data.nil?
@@ -297,8 +297,34 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     result[:name] = name.is_a?(Hash) ? name[:name] : name
     result
   rescue StandardError => e
-    context.debug("FRESH-GET: failed (#{e.message}) — falling back to cached is state")
+    context.debug("perform_fresh_get failed: #{e.message}")
     nil
+  end
+
+  # Caching wrapper around perform_fresh_get — one fresh DSC Get per resource,
+  # reused across all properties during that resource's insync? calls.
+  #
+  # @param context [Object] the Puppet runtime context to operate in and send feedback to
+  # @param name [Hash] the name hash for the resource
+  # @param should [Hash] the desired state hash (used to extract query properties)
+  # @return [Hash] returns a hash with dsc_ prefixed keys and current system values, or nil on failure
+  def get_cached_fresh_state(context, name, should)
+    cache_key = name.is_a?(Hash) ? name[:name] : name
+    unless @cached_fresh_get_results.key?(cache_key)
+      @cached_fresh_get_results[cache_key] = perform_fresh_get(context, name, should)
+    end
+    @cached_fresh_get_results[cache_key]
+  end
+
+  # Delegates to perform_fresh_get for backward compatibility.
+  # Called from set() for DSC_WORKAROUND log entries.
+  #
+  # @param context [Object] the Puppet runtime context to operate in and send feedback to
+  # @param name [Hash] the name hash for the resource
+  # @param should [Hash] the desired state hash (used to extract query properties)
+  # @return [Hash] returns a hash with dsc_ prefixed keys and current system values, or nil on failure
+  def get_fresh_state_for_logging(context, name, should)
+    perform_fresh_get(context, name, should)
   end
 
   # Attempts to set an instance of the DSC resource, invoking the `Set` method and thinly wrapping
@@ -441,24 +467,47 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     data
   end
 
-  # Determine if the DSC Resource is in the desired state. Handles three scenarios:
+  # Compare two values with type coercion. DSC Get often returns integers while
+  # Puppet desired values are strings; this handles that mismatch gracefully.
   #
-  # 1. validation_mode: resource — always uses DSC Test for the definitive answer
-  # 2. validation_mode: property with nil "is" values — falls back to DSC Test because
-  #    DSC's Get method returned null for the property (common when a setting isn't
-  #    explicitly configured in the system policy or the Get method's reverse lookup
-  #    failed). Without this fallback, nil != should always produces a false positive
-  #    change with a blank "Changed from" value in reports.
-  # 3. validation_mode: property with non-nil "is" values — uses the default
-  #    property-by-property comparison from Puppet::Property
+  # @param is_value [Object] the current value from a fresh DSC Get
+  # @param should_value [Object] the desired value from the Puppet manifest
+  # @return [Boolean] true if the values are equivalent
+  def values_equal?(is_value, should_value)
+    return true if is_value == should_value
+
+    # Handle nil/empty equivalence
+    is_empty = is_value.nil? || (is_value.respond_to?(:empty?) && is_value.empty?)
+    should_empty = should_value.nil? || (should_value.respond_to?(:empty?) && should_value.empty?)
+    return true if is_empty && should_empty
+
+    # Try case-insensitive string comparison
+    return true if is_value.to_s.downcase == should_value.to_s.downcase
+
+    false
+  end
+
+  # Determine if the DSC Resource is in the desired state, using fresh DSC Get
+  # results to provide accurate property comparison and real change messages.
+  #
+  # For validation_mode: resource, delegates entirely to DSC Test (unchanged).
+  #
+  # For validation_mode: property (default), performs a fresh DSC Get (one per
+  # resource, cached) that bypasses the get()/canonicalize pipeline, then compares
+  # each dsc_ property against the desired value. Returns:
+  # - true if the property matches (suppresses false positive events)
+  # - [false, "'current' -> 'desired'"] if the property genuinely differs
+  #   (the RSAPI uses the change_message as the Event text in PE)
+  # - nil to fall through to default RSAPI comparison (non-dsc_ properties,
+  #   or if the fresh Get failed)
   #
   # @param context [Object] the Puppet runtime context to operate in and send feedback to
   # @param name [String] the name of the resource being tested
   # @param property_name [Symbol] the name of the property being compared
   # @param is_hash [Hash] the current state of the resource on the system
   # @param should_hash [Hash] the desired state of the resource per the manifest
-  # @return [Boolean, Void] returns true/false if the resource is/isn't in the desired state,
-  #   or nil to fall through to default property comparison.
+  # @return [Boolean, Array, Void] returns true/false/[false, message] if the resource
+  #   is/isn't in the desired state, or nil to fall through to default property comparison.
   def insync?(context, name, property_name, is_hash, should_hash)
     # Resource mode: use DSC Test for everything (existing behavior)
     if should_hash[:validation_mode] == 'resource'
@@ -466,58 +515,27 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       return prior_result.empty? ? invoke_test_method(context, name, should_hash) : prior_result.first[:in_desired_state]
     end
 
-    # Property mode: DSC's Get method can return null for properties it can't
-    # determine — e.g. the setting isn't explicitly in the system policy, or
-    # Get's internal reverse lookup failed. These null values become either nil
-    # or '' in Ruby (stringify_nil_attributes converts nil to '' for String-type
-    # attributes). Either way, the comparison against a real "should" value fails,
-    # producing false positive changes with blank "Changed from" in reports.
-    is_value = is_hash.is_a?(Hash) ? is_hash[property_name] : nil
     should_value = should_hash.is_a?(Hash) ? should_hash[property_name] : nil
 
-    is_missing = is_value.nil? || (is_value.respond_to?(:empty?) && is_value.empty?)
-    should_present = !should_value.nil? && !(should_value.respond_to?(:empty?) && should_value.empty?)
+    # Only intervene for dsc_ properties with a desired value
+    return nil unless property_name.to_s.start_with?('dsc_')
+    return nil if should_value.nil? || (should_value.respond_to?(:empty?) && should_value.empty?)
 
-    if is_missing && should_present
-      # First, check the overall DSC Test result for the whole resource
-      prior_result = fetch_cached_hashes(@cached_test_results, [name])
-      overall_result = if prior_result.empty?
-                         invoke_test_method(context, name, should_hash)
-                       else
-                         prior_result.first[:in_desired_state]
-                       end
-      overall_in_sync = overall_result.is_a?(Array) ? overall_result.first : overall_result
+    # Get fresh current state (cached per resource, bypasses get()/canonicalize pipeline)
+    fresh_state = get_cached_fresh_state(context, name, should_hash)
 
-      # If the whole resource is in desired state, this property is fine
-      return true if overall_in_sync
+    # If fresh Get failed, fall back to default RSAPI comparison
+    return nil if fresh_state.nil?
 
-      # Resource is NOT in desired state. Rather than blaming every nil/empty
-      # property, test this specific property individually against DSC to see
-      # if it's the one that actually needs changing.
-      if property_name.to_s.start_with?('dsc_')
-        cache_key = [name, property_name]
-        unless @cached_per_property_test_results.key?(cache_key)
-          namevar_keys = namevar_attributes(context).select { |k| k.to_s.start_with?('dsc_') }
-          minimal_props = {}
-          namevar_keys.each { |k| minimal_props[k] = should_hash[k] if should_hash.key?(k) }
-          minimal_props[property_name] = should_hash[property_name]
-          data = invoke_dsc_resource(context, name, minimal_props, 'test')
-          @cached_per_property_test_results[cache_key] = data.nil? ? nil : data['indesiredstate']
-        end
+    fresh_value = fresh_state[property_name]
 
-        per_prop_result = @cached_per_property_test_results[cache_key]
-        # nil = DSC call failed, fall through to overall result
-        # true = this specific property is in desired state, don't flag it
-        # false = this specific property is genuinely out of sync
-        return per_prop_result unless per_prop_result.nil?
-      end
-
-      # Fallback: per-property test unavailable or failed — use overall result
-      return false
+    # Compare with type coercion (DSC returns integers, Puppet may have strings)
+    if values_equal?(fresh_value, should_value)
+      true # Property is in sync — suppress false positive
+    else
+      # Property genuinely differs — return tuple with real change message
+      [false, "'#{fresh_value}' -> '#{should_value}'"]
     end
-
-    # Default: let the Resource API handle per-property comparison
-    nil
   end
 
   # Invokes the `Get` method, passing the name_hash as the properties to use with `Invoke-DscResource`
