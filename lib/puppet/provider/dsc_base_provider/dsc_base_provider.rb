@@ -140,10 +140,7 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
 
     # If the resource has already been queried, do not bother querying for it again
     cached_results = fetch_cached_hashes(@cached_query_results, names)
-    unless cached_results.empty?
-      context.notice("GET-DIAG: returning from @cached_query_results, dsc_ values: #{cached_results.first&.select { |k, _v| k.to_s.start_with?('dsc_') }.inspect}")
-      return cached_results
-    end
+    return cached_results unless cached_results.empty?
 
     # Use the raw system state from canonicalize's Get call if available.
     # @cached_canonicalize_results has the unmodified DSC Get response (before
@@ -152,7 +149,6 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     unless @cached_canonicalize_results.empty?
       canon_results = fetch_cached_hashes(@cached_canonicalize_results, names)
       unless canon_results.empty?
-        context.notice("GET-DIAG: returning from @cached_canonicalize_results, dsc_ values: #{canon_results.first&.select { |k, _v| k.to_s.start_with?('dsc_') }.inspect}")
         # Cache these as query results too so subsequent get() calls find them
         canon_results.each do |r|
           @cached_query_results << r.dup if fetch_cached_hashes(@cached_query_results, [r]).empty?
@@ -171,7 +167,6 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       # If dsc_psdscrunascredential was specified, re-add it here.
       mandatory_properties[:dsc_psdscrunascredential] = canonicalized_resource[:dsc_psdscrunascredential] if canonicalized_resource.key?(:dsc_psdscrunascredential)
     end
-    context.notice('GET-DIAG: no cache hit, making fresh invoke_get_method call')
     names.collect do |name|
       name = { name: name } if name.is_a? String
       invoke_get_method(context, name.merge(mandatory_properties))
@@ -244,15 +239,36 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
   def log_change_detail(context, name, is, should)
     return if is.nil? || should.nil?
 
+    # Build context info for the log line
+    type_name = context.type.definition[:name] rescue nil
+    dsc_module = context.type.definition[:dscmeta_module_name] rescue nil
+    resource_title = name.is_a?(Hash) ? name[:name] : name
+    # Try to extract the declaring Puppet class from tags if available
+    tags = should[:tag] || should[:tags]
+    declaring_class = if tags.is_a?(Array)
+                        # Tags include type name, title, and all containing classes.
+                        # Class tags contain '::' — pick the most specific one.
+                        tags.select { |t| t.include?('::') }.last
+                      end
+
     should.each do |property, desired_value|
       next unless property.to_s.start_with?('dsc_')
       next if property == :dsc_psdscrunascredential
+      # Skip namevars — they're identifiers, not managed properties
+      next if namevar_attributes(context).include?(property)
 
       current_value = is[property]
       # Skip if values are the same (case-insensitive for strings)
       next if same?(recursively_downcase(current_value), recursively_downcase(desired_value))
 
-      context.notice(name, "#{property}: '#{current_value}' -> '#{desired_value}'")
+      mof_type = context.type.definition[:attributes][property][:mof_type] rescue nil
+
+      detail = "DSC_WORKAROUND: #{property} '#{current_value}' -> '#{desired_value}'"
+      detail += " (#{mof_type})" if mof_type
+      detail += " | resource: #{type_name}[#{resource_title}]" if type_name
+      detail += " | dsc_module: #{dsc_module}" if dsc_module
+      detail += " | class: #{declaring_class}" if declaring_class
+      context.notice(detail)
     end
   end
 
@@ -269,8 +285,6 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     data = invoke_dsc_resource(context, name, query_props, 'get')
     return nil if data.nil?
 
-    context.notice("FRESH-GET: raw DSC Get result: #{data.inspect}")
-
     # Minimal key processing to match the dsc_ prefix format used by Puppet types
     valid_attributes = context.type.attributes.keys.collect(&:to_s)
     result = {}
@@ -281,8 +295,6 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       result[type_key] = value
     end
     result[:name] = name.is_a?(Hash) ? name[:name] : name
-
-    context.notice("FRESH-GET: processed for logging: #{result.inspect}")
     result
   rescue StandardError => e
     context.debug("FRESH-GET: failed (#{e.message}) — falling back to cached is state")
@@ -485,26 +497,21 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       if property_name.to_s.start_with?('dsc_')
         cache_key = [name, property_name]
         unless @cached_per_property_test_results.key?(cache_key)
-          context.notice("DIAG: Per-property test for '#{property_name}' with should=#{should_value.inspect}")
           namevar_keys = namevar_attributes(context).select { |k| k.to_s.start_with?('dsc_') }
           minimal_props = {}
           namevar_keys.each { |k| minimal_props[k] = should_hash[k] if should_hash.key?(k) }
           minimal_props[property_name] = should_hash[property_name]
-          context.notice("DIAG: minimal_props=#{minimal_props.inspect}")
           data = invoke_dsc_resource(context, name, minimal_props, 'test')
-          context.notice("DIAG: invoke_dsc_resource returned: #{data.inspect}")
           @cached_per_property_test_results[cache_key] = data.nil? ? nil : data['indesiredstate']
         end
 
         per_prop_result = @cached_per_property_test_results[cache_key]
-        context.notice("DIAG: per_prop_result for '#{property_name}' = #{per_prop_result.inspect}")
         # nil = DSC call failed, fall through to overall result
         # true = this specific property is in desired state, don't flag it
         # false = this specific property is genuinely out of sync
         return per_prop_result unless per_prop_result.nil?
       end
 
-      context.notice("DIAG: Falling through to overall false for '#{property_name}'")
       # Fallback: per-property test unavailable or failed — use overall result
       return false
     end
@@ -528,12 +535,6 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     query_props = name_hash.select { |k, v| mandatory_get_attributes(context).include?(k) || (k == :dsc_psdscrunascredential && !v.nil?) }
     data = invoke_dsc_resource(context, name_hash, query_props, 'get')
     return nil if data.nil?
-
-    # PIPELINE-DIAG: Log the raw data from invoke_dsc_resource BEFORE any Ruby processing.
-    # This is the JSON-parsed output from ConvertTo-CanonicalResult on the PowerShell side.
-    # If values are present here, the data loss is in the Ruby pipeline below.
-    # If values are null/empty here, the data loss is in the PowerShell pipeline.
-    context.notice("PIPELINE-DIAG: raw from invoke_dsc_resource: #{data.select { |k, _v| k.to_s !~ /^(PSComputerName|ensure)$/i }.inspect}")
 
     # DSC gives back information we don't care about; filter down to only
     # those properties exposed in the type definition.
@@ -572,9 +573,6 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     data[:name] = name_hash[:name]
 
     data = stringify_nil_attributes(context, data)
-
-    # PIPELINE-DIAG: Log after stringify_nil_attributes to see if values were converted to ''
-    context.notice("PIPELINE-DIAG: after stringify_nil_attributes: #{data.select { |k, _v| k.to_s.start_with?('dsc_') }.inspect}")
 
     # Have to check for this to avoid a weird canonicalization warning
     # The Resource API calls canonicalize against the current state which
