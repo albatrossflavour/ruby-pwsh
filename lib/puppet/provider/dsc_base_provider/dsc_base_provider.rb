@@ -680,8 +680,20 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       #  and null but Puppet does; revert to those values if specified.
       data[type_key] = [] if data[type_key].nil? && query_props.key?(type_key) && query_props[type_key].is_a?(Array)
     end
-    # If a resource is found, it's present, so refill this Puppet-only key
+    # Preserve namevar values from the input hash. DSC Get often returns nil/empty
+    # for namevar properties (e.g., Name => nil), which causes the RSAPI's
+    # namevar_match? to fail when comparing get() results against the resource title.
+    # When namevar_match? fails, the RSAPI discards the entire get() result and
+    # falls back to using just the title hash (namevars only) as the "is" state,
+    # producing blank "Changed from" values in PE Events.
     data[:name] = name_hash[:name]
+    namevar_attributes(context).each do |namevar|
+      next unless name_hash.key?(namevar)
+      # Only backfill if DSC returned nil/empty for this namevar
+      if data[namevar].nil? || (data[namevar].respond_to?(:empty?) && data[namevar].empty?)
+        data[namevar] = name_hash[namevar]
+      end
+    end
 
     data = stringify_nil_attributes(context, data)
 
