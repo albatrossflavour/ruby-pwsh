@@ -533,11 +533,12 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
         return true
       end
 
-      # DSC Test says out of sync. For non-dsc_ properties or properties without
-      # a desired value, we can't provide change detail — return the raw test result.
+      # DSC Test says out of sync. For non-dsc_ properties (like ensurable),
+      # suppress events — these are Puppet-level constructs, not real DSC properties.
+      # The actual changed dsc_ properties will each get their own tuple event.
       unless property_name.to_s.start_with?('dsc_')
-        context.debug("INSYNC_DIAG: #{property_name} not a dsc_ property, returning test_result")
-        return test_result
+        context.debug("INSYNC_DIAG: #{property_name} not a dsc_ property, returning true (suppressing)")
+        return true
       end
       if should_value.nil? || (should_value.respond_to?(:empty?) && should_value.empty?)
         context.debug("INSYNC_DIAG: #{property_name} should_value is nil/empty, returning true (suppressing false positive)")
