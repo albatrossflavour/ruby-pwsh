@@ -339,7 +339,12 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       type_key = :"dsc_#{key.downcase}"
       next unless valid_attributes.include?(type_key.to_s)
 
-      result[type_key] = value
+      # Sanitize .NET serialization artifacts (e.g., "System.Object[]")
+      if value.is_a?(String) && value =~ /^System\.\w+\[\]$/
+        result[type_key] = nil
+      else
+        result[type_key] = value
+      end
     end
     result[:name] = name.is_a?(Hash) ? name[:name] : name
     result
@@ -680,6 +685,17 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       #  and null but Puppet does; revert to those values if specified.
       data[type_key] = [] if data[type_key].nil? && query_props.key?(type_key) && query_props[type_key].is_a?(Array)
     end
+    # Sanitize .NET serialization artifacts: DSC sometimes returns the string
+    # "System.Object[]" (or similar) instead of actual values when it can't
+    # properly serialize a result. These invalid strings fail RSAPI schema
+    # validation for Enum types. Replace with nil which is valid as "undef".
+    data.each do |key, value|
+      if value.is_a?(String) && value =~ /^System\.\w+\[\]$/
+        context.debug("Sanitizing .NET serialization artifact for #{key}: #{value} -> nil")
+        data[key] = nil
+      end
+    end
+
     # Preserve namevar values from the input hash. DSC Get often returns nil/empty
     # for namevar properties (e.g., Name => nil), which causes the RSAPI's
     # namevar_match? to fail when comparing get() results against the resource title.
