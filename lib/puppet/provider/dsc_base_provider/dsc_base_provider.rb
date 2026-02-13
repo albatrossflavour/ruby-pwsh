@@ -16,6 +16,7 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     @cached_query_results = []        # Cache for invoke_get_method calls from get only
     @cached_test_results = []
     @cached_fresh_get_results = {}
+    @insync_property_cache = {}
     @logon_failures = []
     @timeout = nil # default timeout, ps_manager.execute is expecting nil by default..
     super
@@ -573,6 +574,21 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
   def insync?(context, name, property_name, is_hash, should_hash)
     context.debug("INSYNC_DIAG: insync? called for #{property_name}, validation_mode=#{should_hash[:validation_mode].inspect}")
 
+    # Detect the corrective change check: after insync? returns [false, msg] for a
+    # property, Puppet calls insync_values? which calls insync? again for the same
+    # property to compare old_system_value vs previous_value for drift detection.
+    # The RSAPI always passes the same should_hash (manifest desired state) regardless,
+    # so we can't distinguish calls by arguments. Instead, track which properties
+    # returned "out of sync" — the next call for that property is the corrective check.
+    # Return nil so Puppet's default comparison handles it correctly using
+    # old_system_value vs previous_value.
+    cache_key = name.is_a?(Hash) ? name[:name] : name
+    property_key = "#{cache_key}_#{property_name}"
+    if @insync_property_cache.delete(property_key)
+      context.debug("INSYNC_DIAG: #{property_name} second call (corrective check), returning nil for default comparison")
+      return nil
+    end
+
     should_value = should_hash.is_a?(Hash) ? should_hash[property_name] : nil
 
     # In resource validation mode, DSC Test is the authority on overall sync state.
@@ -624,6 +640,8 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     if fresh_state.nil?
       context.debug("INSYNC_DIAG: fresh_state is nil for #{property_name}")
       if should_hash[:validation_mode] == 'resource'
+        # Flag for corrective check detection
+        @insync_property_cache[property_key] = true
         return [false, "#{property_name} changed '' to '#{should_value}'"]
       end
       return nil
@@ -639,6 +657,9 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     else
       change_msg = "#{property_name} changed '#{fresh_value}' to '#{should_value}'"
       context.debug("INSYNC_DIAG: #{property_name} values_equal? => false, change_msg=#{change_msg}")
+      # Flag for corrective check detection — the next call for this property
+      # will be calculate_corrective_change's insync_values? call
+      @insync_property_cache[property_key] = true
       [false, change_msg]
     end
   end
