@@ -516,23 +516,9 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
 
     should_value = should_hash.is_a?(Hash) ? should_hash[property_name] : nil
 
-    # For non-dsc_ properties or properties without a desired value, handle simply
-    unless property_name.to_s.start_with?('dsc_')
-      # In resource mode, non-dsc_ properties still need the DSC Test result
-      if should_hash[:validation_mode] == 'resource'
-        prior_result = fetch_cached_hashes(@cached_test_results, [name])
-        return prior_result.empty? ? invoke_test_method(context, name, should_hash) : prior_result.first[:in_desired_state]
-      end
-      return nil
-    end
-
-    # For dsc_ properties with no desired value, fall through to RSAPI default
-    if should_value.nil? || (should_value.respond_to?(:empty?) && should_value.empty?)
-      context.debug("INSYNC_DIAG: #{property_name} should_value is nil/empty, returning nil")
-      return nil
-    end
-
-    # For resource validation mode, check DSC Test first to determine overall sync state
+    # In resource validation mode, DSC Test is the authority on overall sync state.
+    # Check it first — if in sync, return true for ALL properties (including non-dsc_
+    # and empty-value properties) to suppress false positives.
     if should_hash[:validation_mode] == 'resource'
       prior_result = fetch_cached_hashes(@cached_test_results, [name])
       test_result = if prior_result.empty?
@@ -542,25 +528,42 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
                     end
       in_sync = test_result.is_a?(Array) ? test_result.first : test_result
 
-      # If DSC Test says in sync, this property is fine
       if in_sync
         context.debug("INSYNC_DIAG: #{property_name} DSC Test says in sync, returning true")
         return true
       end
-      # DSC Test says out of sync — fall through to fresh Get comparison below
-      # to determine if THIS specific property changed and provide real values
+
+      # DSC Test says out of sync. For non-dsc_ properties or properties without
+      # a desired value, we can't provide change detail — return the raw test result.
+      unless property_name.to_s.start_with?('dsc_')
+        context.debug("INSYNC_DIAG: #{property_name} not a dsc_ property, returning test_result")
+        return test_result
+      end
+      if should_value.nil? || (should_value.respond_to?(:empty?) && should_value.empty?)
+        context.debug("INSYNC_DIAG: #{property_name} should_value is nil/empty, returning true (suppressing false positive)")
+        return true
+      end
+
+      # Fall through to fresh Get comparison below for dsc_ properties with values
       context.debug("INSYNC_DIAG: #{property_name} DSC Test says out of sync, checking fresh Get for details")
+    else
+      # Property validation mode: only intervene for dsc_ properties with a desired value
+      unless property_name.to_s.start_with?('dsc_')
+        return nil
+      end
+      if should_value.nil? || (should_value.respond_to?(:empty?) && should_value.empty?)
+        context.debug("INSYNC_DIAG: #{property_name} should_value is nil/empty, returning nil")
+        return nil
+      end
     end
 
     # Get fresh current state (cached per resource, bypasses get()/canonicalize pipeline)
     fresh_state = get_cached_fresh_state(context, name, should_hash)
 
-    # If fresh Get failed, fall back to default RSAPI comparison (property mode)
-    # or DSC Test result (resource mode)
+    # If fresh Get failed, fall back appropriately
     if fresh_state.nil?
       context.debug("INSYNC_DIAG: fresh_state is nil for #{property_name}")
       if should_hash[:validation_mode] == 'resource'
-        # Resource mode: DSC Test already said out of sync, report as changed without detail
         return [false, "'' -> '#{should_value}'"]
       end
       return nil
@@ -572,11 +575,10 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     # Compare with type coercion (DSC returns integers, Puppet may have strings)
     if values_equal?(fresh_value, should_value)
       context.debug("INSYNC_DIAG: #{property_name} values_equal? => true")
-      true # Property is in sync — suppress false positive
+      true
     else
       change_msg = "'#{fresh_value}' -> '#{should_value}'"
       context.debug("INSYNC_DIAG: #{property_name} values_equal? => false, change_msg=#{change_msg}")
-      # Property genuinely differs — return tuple with real change message
       [false, change_msg]
     end
   end
