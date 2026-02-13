@@ -167,10 +167,57 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       # If dsc_psdscrunascredential was specified, re-add it here.
       mandatory_properties[:dsc_psdscrunascredential] = canonicalized_resource[:dsc_psdscrunascredential] if canonicalized_resource.key?(:dsc_psdscrunascredential)
     end
-    names.collect do |name|
+    results = names.collect do |name|
       name = { name: name } if name.is_a? String
       invoke_get_method(context, name.merge(mandatory_properties))
     end
+
+    # The invoke_get_method pipeline can produce empty/nil values for properties
+    # due to cache/canonicalize interactions. Do a fresh DSC Get (bypassing all
+    # caching) and backfill any empty values so that event.previous_value has
+    # real data for PE's "Changed from" column.
+    enrich_results_with_fresh_get(context, results, names)
+  end
+
+  # Backfills empty/nil property values in get() results with data from a fresh
+  # DSC Get call. This ensures event.previous_value (PE's "Changed from" column)
+  # shows real current values instead of blanks.
+  #
+  # @param context [Object] the Puppet runtime context
+  # @param results [Array<Hash>] the results from invoke_get_method
+  # @param names [Array<Hash>] the name hashes passed to get()
+  # @return [Array<Hash>] the enriched results
+  def enrich_results_with_fresh_get(context, results, names)
+    return results if results.nil? || results.empty?
+
+    results.each_with_index do |result, idx|
+      next if result.nil?
+
+      # Check if any dsc_ properties have empty values that need backfilling
+      has_empty = result.any? do |k, v|
+        k.to_s.start_with?('dsc_') && (v.nil? || (v.respond_to?(:empty?) && v.empty?))
+      end
+      next unless has_empty
+
+      # Build a should-like hash from the canonicalized resource for the fresh Get
+      should = @cached_canonicalized_resource.first&.dup || {}
+      should.merge!(names[idx]) if names[idx].is_a?(Hash)
+
+      fresh = perform_fresh_get(context, names[idx], should)
+      next if fresh.nil?
+
+      context.debug("GET_ENRICH: backfilling empty values from fresh Get for #{result[:name]}")
+      result.each do |k, v|
+        next unless k.to_s.start_with?('dsc_')
+        next unless v.nil? || (v.respond_to?(:empty?) && v.empty?)
+        next unless fresh.key?(k) && !fresh[k].nil?
+
+        result[k] = fresh[k]
+        context.debug("GET_ENRICH: #{k} backfilled with #{fresh[k].inspect}")
+      end
+    end
+
+    results
   end
 
   # Determines whether a resource is ensurable and which message to write (create, update, or delete),
