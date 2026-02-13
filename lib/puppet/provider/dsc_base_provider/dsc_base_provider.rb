@@ -565,7 +565,7 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     if fresh_state.nil?
       context.debug("INSYNC_DIAG: fresh_state is nil for #{property_name}")
       if should_hash[:validation_mode] == 'resource'
-        return [false, "'' -> '#{should_value}'"]
+        return [false, "#{property_name} changed '' to '#{should_value}'"]
       end
       return nil
     end
@@ -578,7 +578,7 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       context.debug("INSYNC_DIAG: #{property_name} values_equal? => true")
       true
     else
-      change_msg = "'#{fresh_value}' -> '#{should_value}'"
+      change_msg = "#{property_name} changed '#{fresh_value}' to '#{should_value}'"
       context.debug("INSYNC_DIAG: #{property_name} values_equal? => false, change_msg=#{change_msg}")
       [false, change_msg]
     end
