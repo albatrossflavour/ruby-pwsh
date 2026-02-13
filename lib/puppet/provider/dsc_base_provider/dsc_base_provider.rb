@@ -310,8 +310,11 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
   # @return [Hash] returns a hash with dsc_ prefixed keys and current system values, or nil on failure
   def get_cached_fresh_state(context, name, should)
     cache_key = name.is_a?(Hash) ? name[:name] : name
+    context.debug("INSYNC_DIAG: get_cached_fresh_state called, cache_key=#{cache_key.inspect}, name class=#{name.class}, cached=#{@cached_fresh_get_results.key?(cache_key)}")
     unless @cached_fresh_get_results.key?(cache_key)
-      @cached_fresh_get_results[cache_key] = perform_fresh_get(context, name, should)
+      result = perform_fresh_get(context, name, should)
+      context.debug("INSYNC_DIAG: perform_fresh_get returned #{result.nil? ? 'nil' : result.keys.inspect}")
+      @cached_fresh_get_results[cache_key] = result
     end
     @cached_fresh_get_results[cache_key]
   end
@@ -509,8 +512,11 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
   # @return [Boolean, Array, Void] returns true/false/[false, message] if the resource
   #   is/isn't in the desired state, or nil to fall through to default property comparison.
   def insync?(context, name, property_name, is_hash, should_hash)
+    context.debug("INSYNC_DIAG: insync? called for #{property_name}, name=#{name.inspect}, should_hash class=#{should_hash.class}")
+
     # Resource mode: use DSC Test for everything (existing behavior)
     if should_hash[:validation_mode] == 'resource'
+      context.debug("INSYNC_DIAG: resource validation mode, delegating to DSC Test")
       prior_result = fetch_cached_hashes(@cached_test_results, [name])
       return prior_result.empty? ? invoke_test_method(context, name, should_hash) : prior_result.first[:in_desired_state]
     end
@@ -518,23 +524,36 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     should_value = should_hash.is_a?(Hash) ? should_hash[property_name] : nil
 
     # Only intervene for dsc_ properties with a desired value
-    return nil unless property_name.to_s.start_with?('dsc_')
-    return nil if should_value.nil? || (should_value.respond_to?(:empty?) && should_value.empty?)
+    unless property_name.to_s.start_with?('dsc_')
+      context.debug("INSYNC_DIAG: #{property_name} not a dsc_ property, returning nil")
+      return nil
+    end
+    if should_value.nil? || (should_value.respond_to?(:empty?) && should_value.empty?)
+      context.debug("INSYNC_DIAG: #{property_name} should_value is nil/empty (#{should_value.inspect}), returning nil")
+      return nil
+    end
 
     # Get fresh current state (cached per resource, bypasses get()/canonicalize pipeline)
     fresh_state = get_cached_fresh_state(context, name, should_hash)
 
     # If fresh Get failed, fall back to default RSAPI comparison
-    return nil if fresh_state.nil?
+    if fresh_state.nil?
+      context.debug("INSYNC_DIAG: fresh_state is nil for #{property_name}, returning nil (falling back to RSAPI)")
+      return nil
+    end
 
     fresh_value = fresh_state[property_name]
+    context.debug("INSYNC_DIAG: #{property_name} fresh_value=#{fresh_value.inspect} (#{fresh_value.class}), should_value=#{should_value.inspect} (#{should_value.class})")
 
     # Compare with type coercion (DSC returns integers, Puppet may have strings)
     if values_equal?(fresh_value, should_value)
+      context.debug("INSYNC_DIAG: #{property_name} values_equal? => true, returning true (in sync)")
       true # Property is in sync — suppress false positive
     else
+      change_msg = "'#{fresh_value}' -> '#{should_value}'"
+      context.debug("INSYNC_DIAG: #{property_name} values_equal? => false, returning [false, #{change_msg.inspect}]")
       # Property genuinely differs — return tuple with real change message
-      [false, "'#{fresh_value}' -> '#{should_value}'"]
+      [false, change_msg]
     end
   end
 
