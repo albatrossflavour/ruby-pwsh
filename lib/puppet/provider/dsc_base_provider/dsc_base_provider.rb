@@ -343,6 +343,12 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
       if value.is_a?(String) && value =~ /^System\.\w+\[\]$/
         result[type_key] = nil
       else
+        # Normalize CIM instances the same way invoke_get_method does,
+        # so fresh values are comparable to canonicalized should values.
+        if value.is_a?(Enumerable)
+          downcase_hash_keys!(value)
+          munge_cim_instances!(value)
+        end
         result[type_key] = value
       end
     end
@@ -522,8 +528,10 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     data
   end
 
-  # Compare two values with type coercion. DSC Get often returns integers while
-  # Puppet desired values are strings; this handles that mismatch gracefully.
+  # Compare two values with type coercion. Handles the mismatches common in DSC:
+  # integers vs strings, case differences, array ordering, and nested CIM instances.
+  # Uses the same recursively_sort/recursively_downcase helpers the provider already
+  # relies on for canonicalize and log_change_detail comparisons.
   #
   # @param is_value [Object] the current value from a fresh DSC Get
   # @param should_value [Object] the desired value from the Puppet manifest
@@ -536,10 +544,9 @@ class Puppet::Provider::DscBaseProvider # rubocop:disable Metrics/ClassLength
     should_empty = should_value.nil? || (should_value.respond_to?(:empty?) && should_value.empty?)
     return true if is_empty && should_empty
 
-    # Try case-insensitive string comparison
-    return true if is_value.to_s.downcase == should_value.to_s.downcase
-
-    false
+    # Normalize and compare: sort for order-insensitive array/hash comparison,
+    # downcase for case-insensitive string comparison, handles nested structures.
+    same?(recursively_downcase(is_value), recursively_downcase(should_value))
   end
 
   # Determine if the DSC Resource is in the desired state, using fresh DSC Get
